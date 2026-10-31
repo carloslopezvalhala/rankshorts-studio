@@ -431,7 +431,7 @@ function ensureAudio() {
 function applyGains() {
   if (!actx) return;
   previewGain.gain.value = $('#preview-mute').checked && !exporting ? 0 : 1;
-  for (const c of P.clips) { const el = els[c.id]; if (el && el._gain) el._gain.gain.value = c.audio ? c.vol : 0; }
+  for (const c of P.clips) { const el = els[c.id]; if (el && el._gain) el._gain.gain.value = c.audio && P.clips[activeIdx] === c ? c.vol : 0; }
   if (musicEl && musicEl._gain) {
     let v = P.audio.musicVol;
     if (P.audio.fadeOut && playing) v *= clamp((total() - T) / 1.2, 0, 1);
@@ -440,14 +440,19 @@ function applyGains() {
 }
 function sfxPop(big) {
   if (!actx) return;
-  const t0 = actx.currentTime, o = actx.createOscillator(), g = actx.createGain();
+  const g = popInto(actx, actx.currentTime, big); route(g);
+}
+// shared by live preview and offline export: returns the gain node to connect
+function popInto(ac, t0, big) {
+  const o = ac.createOscillator(), g = ac.createGain();
   o.type = 'triangle';
   o.frequency.setValueAtTime(big ? 420 : 300, t0);
   o.frequency.exponentialRampToValueAtTime(big ? 1400 : 900, t0 + 0.13);
   g.gain.setValueAtTime(0.0001, t0);
   g.gain.exponentialRampToValueAtTime(big ? 0.45 : 0.3, t0 + 0.015);
   g.gain.exponentialRampToValueAtTime(0.0001, t0 + (big ? 0.45 : 0.25));
-  o.connect(g); route(g); o.start(t0); o.stop(t0 + 0.5);
+  o.connect(g); o.start(t0); o.stop(t0 + 0.5);
+  return g;
 }
 async function setMusic(file) {
   if (musicEl) { musicEl.pause(); musicEl.remove(); musicEl = null; }
@@ -482,6 +487,7 @@ const findSeg = (S, t) => S.find(s => t >= s.start && t < s.end);
 const rankOf = i => P.order === 'desc' ? P.clips.length - i : i + 1;
 const idxOfRank = r => P.order === 'desc' ? P.clips.length - r : r - 1;
 
+const PREROLL = 0.15;
 let T = 0, playing = false, lastTs = 0, activeIdx = -1, rafId = 0, toId = 0, stall = { t: -1, since: 0 };
 // rAF stops in hidden tabs; the timeout keeps playback/export moving there
 function schedule() { rafId = requestAnimationFrame(tick); toId = setTimeout(() => tick(performance.now()), 60); }
@@ -491,6 +497,8 @@ function play() {
   ensureAudio();
   if (T >= total() - 0.02) T = 0;
   playing = true; activeIdx = -1; lastTs = performance.now(); stall = { t: -1, since: lastTs };
+  const cur = findSeg(segs(), T);
+  P.clips.forEach((c, i) => { if (!cur || i !== cur.i) primeClip(c); });
   startMusic();
   schedule(); updatePlayBtn();
 }
@@ -502,16 +510,23 @@ function pause() {
   playing = false; unschedule(); haltMedia(); activeIdx = -1; updatePlayBtn(); seekTo(T);
 }
 const togglePlay = () => (playing ? pause() : play());
+// park a paused video on its first frame so the cut to it is instant
+function primeClip(c) {
+  const el = c && c.kind === 'video' ? els[c.id] : null;
+  if (el && el.paused && el.readyState >= 1 && Math.abs(el.currentTime - c.in) > 0.04) el.currentTime = c.in;
+}
 function enterSeg(seg) {
   const prev = activeIdx >= 0 ? P.clips[activeIdx] : null;
   if (prev && prev.kind === 'video' && els[prev.id]) { const pm = els[prev.id]; pm.pause(); try { pm.currentTime = prev.in; } catch (e) {} }
   activeIdx = seg.i;
   const c = seg.c, m = els[c.id];
   if (c.kind === 'video' && m) {
-    const want = c.in + (T - seg.start);
-    if (Math.abs(m.currentTime - want) > 0.08) m.currentTime = want;
+    const want = c.in + (T - seg.start), ahead = m.currentTime - want;
+    // a pre-rolled clip is already running at the right spot: never re-seek it
+    if (m.paused ? Math.abs(ahead) > 0.08 : (ahead < -0.3 || ahead > 0.35)) m.currentTime = want;
     m.play().catch(() => {});
   }
+  primeClip(P.clips[seg.i + 1]);
   if (P.style.sfx && T - seg.start < 0.15) sfxPop(rankOf(seg.i) === 1);
   applyGains();
 }
@@ -520,7 +535,7 @@ function finishPlayback() {
   const last = activeIdx >= 0 ? P.clips[activeIdx] : null;
   if (last && last.kind === 'video' && els[last.id]) try { els[last.id].currentTime = last.in; } catch (e) {}
   activeIdx = -1; T = total(); updatePlayBtn(); draw(); updateTransport();
-  if (exporting) setTimeout(() => exporting && exporting.rec.state !== 'inactive' && exporting.rec.stop(), 350);
+  if (exporting && exporting.rec) setTimeout(() => exporting && exporting.rec.state !== 'inactive' && exporting.rec.stop(), 350);
 }
 function tick(ts) {
   unschedule();
@@ -540,6 +555,12 @@ function tick(ts) {
     if (T !== stall.t) stall = { t: T, since: ts };
     else if (ts - stall.since > 1500) { T = seg.end; stall = { t: T, since: ts }; }
   } else T += dt;
+  // pre-roll: start the next video a moment early so play() latency never shows at the cut
+  const nx = S[seg.i + 1], left = seg.end - T;
+  if (nx && nx.c.kind === 'video' && left < PREROLL && nx.c.in >= left) {
+    const ne = els[nx.c.id];
+    if (ne && ne.paused && ne.readyState >= 2) { ne.currentTime = nx.c.in - left; ne.play().catch(() => {}); }
+  }
   if (T >= tot) { T = tot; return finishPlayback(); }
   applyGains(); draw(); updateTransport();
   schedule();
@@ -568,6 +589,8 @@ const bctx = blurCv.getContext('2d');
 let regions = [], drawQueued = false;
 function reqDraw() { if (playing || drawQueued) return; drawQueued = true; requestAnimationFrame(() => { drawQueued = false; draw(); }); }
 const S_ = () => P.style;
+let rendering = false; // true while the frame-by-frame export draws
+const animating = () => playing || rendering;
 function fontStr(size) { const f = S_().font; return `${f === 'Montserrat' ? '900 ' : ''}${Math.round(size)}px "${f}", Impact, sans-serif`; }
 function txt(s) { return S_().upper ? String(s).toUpperCase() : String(s); }
 function outlined(t, x, y, size, fill, stroke, align = 'center') {
@@ -600,24 +623,28 @@ function fitWrap(t, maxW, size, maxLines) {
   return { lines, size: s };
 }
 function drawScaled(m, vw, vh, s, a, c) { const w = vw * s, h = vh * s; c.drawImage(m, a.x + (a.w - w) / 2, a.y + (a.h - h) / 2, w, h); }
-function drawMedia(c, a, local) {
+const heldCv = document.createElement('canvas'); heldCv.width = W; heldCv.height = H;
+const hctx = heldCv.getContext('2d');
+let heldOk = false;
+function drawMedia(c, a, local, g) {
   const m = els[c.id]; if (!m) return false;
   let vw, vh;
-  if (c.kind === 'video') { if (m.readyState < 2) return false; vw = m.videoWidth; vh = m.videoHeight; }
+  if (c.kind === 'video') { if (m.readyState < 2 || !m.videoWidth) return false; vw = m.videoWidth; vh = m.videoHeight; }
   else { if (!m.complete || !m.naturalWidth) return false; vw = m.naturalWidth; vh = m.naturalHeight; }
+  g.fillStyle = S_().bg; g.fillRect(a.x, a.y, a.w, a.h);
   const fit = c.fit || S_().fit;
   let zoom = c.zoom || 1;
   if (c.kind === 'image') zoom *= 1 + 0.07 * clamp(local / Math.max(c.dur, 0.1), 0, 1); // Ken Burns
   const cover = Math.max(a.w / vw, a.h / vh), contain = Math.min(a.w / vw, a.h / vh);
-  ctx.save(); ctx.beginPath(); ctx.rect(a.x, a.y, a.w, a.h); ctx.clip();
+  g.save(); g.beginPath(); g.rect(a.x, a.y, a.w, a.h); g.clip();
   if (fit === 'blur') {
     bctx.drawImage(m, 0, 0, blurCv.width, blurCv.height);
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(blurCv, a.x - 40, a.y - 40, a.w + 80, a.h + 80);
-    ctx.fillStyle = 'rgba(0,0,0,.45)'; ctx.fillRect(a.x, a.y, a.w, a.h);
-    drawScaled(m, vw, vh, contain * zoom, a, ctx);
-  } else drawScaled(m, vw, vh, (fit === 'cover' ? cover : contain) * zoom, a, ctx);
-  ctx.restore();
+    g.imageSmoothingQuality = 'high';
+    g.drawImage(blurCv, a.x - 40, a.y - 40, a.w + 80, a.h + 80);
+    g.fillStyle = 'rgba(0,0,0,.45)'; g.fillRect(a.x, a.y, a.w, a.h);
+    drawScaled(m, vw, vh, contain * zoom, a, g);
+  } else drawScaled(m, vw, vh, (fit === 'cover' ? cover : contain) * zoom, a, g);
+  g.restore();
   return true;
 }
 function roundRect(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, y, w, h, r) : ctx.rect(x, y, w, h); }
@@ -631,7 +658,9 @@ function draw() {
   const area = band ? { x: 0, y: S.bandH, w: W, h: H - S.bandH } : { x: 0, y: 0, w: W, h: H };
   if (band) { ctx.fillStyle = S.bandColor; ctx.fillRect(0, 0, W, S.bandH); }
 
-  if (seg) drawMedia(seg.c, area, T - seg.start);
+  if (seg && drawMedia(seg.c, area, T - seg.start, hctx)) heldOk = true;
+  if (seg && heldOk) ctx.drawImage(heldCv, area.x, area.y, area.w, area.h, area.x, area.y, area.w, area.h);
+  if (!seg) heldOk = false;
   if (!P.clips.length) {
     ctx.fillStyle = '#ffffff22'; ctx.font = '600 44px Inter'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText('Añade clips para empezar', W / 2, H * 0.62);
@@ -662,7 +691,7 @@ function draw() {
       const revealed = act >= 0 && idx <= act, isAct = idx === act;
       const numColor = S.podium && r <= 3 ? ['#ffd700', '#d9d9d9', '#d08a4a'][r - 1] : S.listColor;
       let sc = 1;
-      if (isAct && playing) { const p = clamp((T - seg.start) / 0.35, 0, 1); sc = 0.7 + 0.3 * easeOutBack(p); }
+      if (isAct && animating()) { const p = clamp((T - seg.start) / 0.35, 0, 1); sc = 0.7 + 0.3 * easeOutBack(p); }
       ctx.save(); ctx.translate(S.listX, y); ctx.scale(sc, sc);
       outlined(r + '.', 0, 0, S.listSize, numColor, S.listStroke, 'left');
       const lx = numW + S.listSize * 0.28, maxW = W - S.listX - lx - 30;
@@ -691,7 +720,7 @@ function draw() {
 
   // hook
   if (P.hook.on && P.hook.text.trim() && T < P.hook.dur && N) {
-    const p = clamp(T / 0.3, 0, 1), sc = playing ? 0.6 + 0.4 * easeOutBack(p) : 1;
+    const p = clamp(T / 0.3, 0, 1), sc = animating() ? 0.6 + 0.4 * easeOutBack(p) : 1;
     const fade = clamp((P.hook.dur - T) / 0.25, 0, 1);
     const { lines, size } = fitWrap(txt(P.hook.text), W - 140, S.hookSize, 3);
     const lh = size * 1.08, h0 = lh * lines.length;
@@ -1017,9 +1046,162 @@ function download(blob, name) {
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
   document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 60000);
 }
+const FPS = 30;
+const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/+esm';
+const CANCELLED = new Error('cancelled');
 async function exportVideo() {
   if (!P.clips.length) return toast('Añade clips primero');
   if (P.clips.some(c => c.missing)) return toast('Hay clips sin archivo: quítalos antes de exportar');
+  if (exporting) return;
+  if (playing) pause();
+  if (window.VideoEncoder && window.VideoFrame && window.OfflineAudioContext) {
+    try { return await exportFrames(); }
+    catch (e) {
+      rendering = false; exporting = null; $('#modal').classList.remove('on');
+      if (e === CANCELLED) { P.clips.forEach(primeClip); seekTo(0); return toast('Exportación cancelada'); }
+      console.warn('Exportación fotograma a fotograma no disponible:', e);
+      toast('Este navegador no permite la exportación precisa: uso la de tiempo real');
+    }
+  }
+  return exportRealtime();
+}
+
+/* Frame-by-frame export: every frame is seeked exactly and encoded with WebCodecs,
+   audio is mixed offline. Output does not depend on how fast the device plays video. */
+async function pickVideoConfig() {
+  for (const codec of ['avc1.640028', 'avc1.4d0028', 'avc1.420028']) {
+    const cfg = { codec, width: W, height: H, bitrate: 12_000_000, framerate: FPS, avc: { format: 'avc' } };
+    try { if ((await VideoEncoder.isConfigSupported(cfg)).supported) return cfg; } catch (e) {}
+  }
+  return null;
+}
+async function pickAudioConfig() {
+  if (!window.AudioEncoder || !window.AudioData) return null;
+  for (const [codec, mux] of [['mp4a.40.2', 'aac'], ['opus', 'opus']]) {
+    const cfg = { codec, sampleRate: 48000, numberOfChannels: 2, bitrate: 192_000 };
+    try { if ((await AudioEncoder.isConfigSupported(cfg)).supported) return { cfg, mux }; } catch (e) {}
+  }
+  return null;
+}
+async function mixAudio(tot) {
+  const SR = 48000, oc = new OfflineAudioContext(2, Math.max(1, Math.ceil(tot * SR)), SR);
+  const cache = {};
+  const decode = async url => {
+    if (!(url in cache)) {
+      try { cache[url] = await oc.decodeAudioData(await (await fetch(url)).arrayBuffer()); } catch (e) { cache[url] = null; }
+    }
+    return cache[url];
+  };
+  for (const s of segs()) {
+    const c = s.c;
+    if (P.style.sfx) popInto(oc, s.start, rankOf(s.i) === 1).connect(oc.destination);
+    if (c.kind !== 'video' || !c.audio || !c.vol || !urls[c.fileId]) continue;
+    const buf = await decode(urls[c.fileId]); // a video without an audio track decodes to null
+    if (!buf || c.in >= buf.duration) continue;
+    const src = oc.createBufferSource(), g = oc.createGain();
+    src.buffer = buf; g.gain.value = c.vol;
+    src.connect(g).connect(oc.destination);
+    src.start(s.start, c.in, Math.min(c.dur, buf.duration - c.in));
+  }
+  if (musicEl && P.audio.musicVol > 0) {
+    const buf = await decode(musicEl.src);
+    if (buf) {
+      const src = oc.createBufferSource(), g = oc.createGain(), v = P.audio.musicVol;
+      src.buffer = buf; src.loop = true;
+      g.gain.setValueAtTime(v, 0);
+      if (P.audio.fadeOut) { g.gain.setValueAtTime(v, Math.max(0, tot - 1.2)); g.gain.linearRampToValueAtTime(0, tot); }
+      src.connect(g).connect(oc.destination);
+      src.start(0, (P.audio.musicOffset || 0) % buf.duration);
+    }
+  }
+  return oc.startRendering();
+}
+async function encodeAudio(buf, a, muxer) {
+  let err = null;
+  const enc = new AudioEncoder({ output: (ch, meta) => muxer.addAudioChunk(ch, meta), error: e => (err = e) });
+  enc.configure(a.cfg);
+  const SR = buf.sampleRate, L = buf.getChannelData(0), R = buf.numberOfChannels > 1 ? buf.getChannelData(1) : L, STEP = 4800;
+  for (let i = 0; i < buf.length; i += STEP) {
+    const k = Math.min(STEP, buf.length - i), data = new Float32Array(k * 2);
+    data.set(L.subarray(i, i + k), 0); data.set(R.subarray(i, i + k), k);
+    const ad = new AudioData({ format: 'f32-planar', sampleRate: SR, numberOfFrames: k, numberOfChannels: 2, timestamp: Math.round(i * 1e6 / SR), data });
+    enc.encode(ad); ad.close();
+    if (enc.encodeQueueSize > 20) await new Promise(r => setTimeout(r, 0));
+  }
+  await enc.flush(); enc.close();
+  if (err) throw err;
+}
+function seekExact(el, t) {
+  return new Promise(res => {
+    if (Math.abs(el.currentTime - t) < 0.0005 && el.readyState >= 2) return res();
+    let done = false, to = 0;
+    const fin = async () => {
+      if (done) return; done = true; el.removeEventListener('seeked', fin); clearTimeout(to);
+      for (let k = 0; k < 100 && el.readyState < 2; k++) await new Promise(r => setTimeout(r, 20));
+      res();
+    };
+    el.addEventListener('seeked', fin); to = setTimeout(fin, 5000);
+    el.currentTime = t;
+  });
+}
+async function exportFrames() {
+  const vcfg = await pickVideoConfig(), acfg = await pickAudioConfig();
+  if (!vcfg) throw new Error('sin codificador H.264');
+  if (!acfg) throw new Error('sin codificador de audio');
+  const { Muxer, ArrayBufferTarget } = await import(MUXER_URL);
+  await document.fonts.ready;
+  exporting = { cancelled: false };
+  const tot = total(), N = Math.max(1, Math.round(tot * FPS)), S = segs();
+  $('#modal').classList.add('on'); $('#m-bar').style.width = '0';
+  $('#m-title').textContent = 'Exportando vídeo fotograma a fotograma…';
+  $('#m-text').textContent = 'Mezclando el audio…';
+  const target = new ArrayBufferTarget();
+  const muxer = new Muxer({
+    target, fastStart: 'in-memory', firstTimestampBehavior: 'offset',
+    video: { codec: 'avc', width: W, height: H, frameRate: FPS },
+    audio: { codec: acfg.mux, numberOfChannels: 2, sampleRate: 48000 },
+  });
+  const mixed = await mixAudio(tot);
+  if (exporting.cancelled) throw CANCELLED;
+  await encodeAudio(mixed, acfg, muxer);
+  let verr = null;
+  const venc = new VideoEncoder({ output: (ch, meta) => muxer.addVideoChunk(ch, meta), error: e => (verr = e) });
+  venc.configure(vcfg);
+  haltMedia(); rendering = true;
+  const started = performance.now();
+  try {
+    for (let f = 0; f < N; f++) {
+      if (exporting.cancelled) throw CANCELLED;
+      if (verr) throw verr;
+      const t = f / FPS, s = findSeg(S, t) || S[S.length - 1], el = els[s.c.id];
+      if (s.c.kind === 'video' && el) {
+        const local = Math.min(t - s.start, s.c.dur - 0.5 / FPS);
+        await seekExact(el, Math.min(s.c.in + local, (el.duration || Infinity) - 0.02));
+      }
+      T = t; draw();
+      const vf = new VideoFrame(cv, { timestamp: Math.round(f * 1e6 / FPS), duration: Math.round(1e6 / FPS) });
+      venc.encode(vf, { keyFrame: f % (FPS * 2) === 0 }); vf.close();
+      while (venc.encodeQueueSize > 6) await new Promise(r => setTimeout(r, 2));
+      if (f % 5 === 0) {
+        const spent = (performance.now() - started) / 1000, eta = f ? spent / f * (N - f) : 0;
+        $('#m-bar').style.width = (100 * f / N).toFixed(1) + '%';
+        $('#m-text').textContent = `Fotograma ${f} de ${N}${f > 15 ? ` · quedan ~${Math.ceil(eta)} s` : ''}. Puedes cambiar de pestaña, pero no cierres esta.`;
+      }
+    }
+    await venc.flush();
+  } finally {
+    rendering = false;
+    try { venc.close(); } catch (e) {}
+  }
+  muxer.finalize();
+  exporting = null; $('#modal').classList.remove('on');
+  download(new Blob([target.buffer], { type: 'video/mp4' }), `${slug(P.title)}.mp4`);
+  toast('Vídeo exportado (.mp4)');
+  P.clips.forEach(primeClip); seekTo(0);
+}
+
+/* Real-time fallback (browsers without WebCodecs): records the canvas while it plays. */
+async function exportRealtime() {
   if (!window.MediaRecorder) return toast('Este navegador no puede grabar vídeo. Usa Chrome o Edge.');
   if (playing) pause();
   ensureAudio(); await actx.resume(); await document.fonts.ready;
@@ -1031,7 +1213,7 @@ async function exportVideo() {
   rec.ondataavailable = e => e.data.size && chunks.push(e.data);
   exporting = { rec, cancelled: false };
   $('#modal').classList.add('on'); $('#m-bar').style.width = '0';
-  $('#m-title').textContent = 'Exportando vídeo…';
+  $('#m-title').textContent = 'Exportando vídeo en tiempo real…';
   rec.onstop = () => {
     const ex = exporting; exporting = null; $('#modal').classList.remove('on'); applyGains();
     if (!ex || ex.cancelled) return toast('Exportación cancelada');
@@ -1047,7 +1229,11 @@ async function exportVideo() {
   play();
 }
 $('#btn-export').addEventListener('click', exportVideo);
-$('#m-cancel').addEventListener('click', () => { if (!exporting) return; exporting.cancelled = true; pause(); exporting.rec.stop(); });
+$('#m-cancel').addEventListener('click', () => {
+  if (!exporting) return;
+  exporting.cancelled = true;
+  if (exporting.rec) { pause(); exporting.rec.stop(); }
+});
 $('#btn-cover').addEventListener('click', () => { draw(); cv.toBlob(b => download(b, `${slug(P.title)}-portada.png`), 'image/png'); });
 $('#btn-new').addEventListener('click', async () => {
   if (!confirm('¿Empezar un ranking nuevo? Se quitarán los clips y la música de este proyecto (el estilo se mantiene).')) return;
